@@ -72,7 +72,7 @@ def focus_instructions(focus: str) -> str:
         "tests": "Prioritize test coverage: missing tests, weak assertions, and untested edge cases.",
         "all": "Balance bugs, security, performance, and test coverage equally.",
     }
-    return guides[focus]
+ 
 
 
 def parse_args():
