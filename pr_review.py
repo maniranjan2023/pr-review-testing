@@ -18,12 +18,16 @@ How to test:
        --pr 42             review a specific PR
        --dry-run           review without posting to GitHub
        --output file.md    save review locally (default: review_output.md)
+       --focus security    emphasize security, performance, tests, or all
+       --json              also save review metadata as JSON
   5. Check the PR -> the review should appear as a comment (unless --dry-run).
 """
 
 import argparse
 import asyncio
+import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -40,6 +44,35 @@ from composio_openai_agents import OpenAIAgentsProvider
 # Config (from .env)
 # ---------------------------------------------------------------------------
 DEFAULT_OUTPUT_FILE = os.environ.get("REVIEW_OUTPUT_FILE", "review_output.md")
+FOCUS_CHOICES = ("all", "security", "performance", "tests")
+
+
+def validate_env() -> None:
+    missing = [key for key in ("OPENAI_API_KEY", "COMPOSIO_API_KEY") if not os.environ.get(key)]
+    if missing:
+        joined = ", ".join(missing)
+        raise SystemExit(f"Missing required env vars: {joined}")
+
+
+def pr_url(repo: str, pr_number: int | None) -> str | None:
+    if not pr_number:
+        return None
+    return f"https://github.com/{repo}/pull/{pr_number}"
+
+
+def extract_pr_number(text: str) -> int | None:
+    match = re.search(r"(?:PR|pull request)\s*#?\s*(\d+)", text, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def focus_instructions(focus: str) -> str:
+    guides = {
+        "security": "Prioritize security: secrets, auth, injection, unsafe defaults, and data exposure.",
+        "performance": "Prioritize performance: hot paths, N+1 queries, unnecessary work, and memory use.",
+        "tests": "Prioritize test coverage: missing tests, weak assertions, and untested edge cases.",
+        "all": "Balance bugs, security, performance, and test coverage equally.",
+    }
+    return guides[focus]
 
 
 def parse_args():
@@ -65,22 +98,74 @@ def parse_args():
         action="store_true",
         help="Run the review but do not post a comment on GitHub",
     )
+    parser.add_argument(
+        "--focus",
+        choices=FOCUS_CHOICES,
+        default="all",
+        help="What the reviewer should emphasize",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Also write review metadata to a .json file next to the markdown output",
+    )
     return parser.parse_args()
 
 
-def save_review(output_path: str, repo: str, pr_number: int | None, content: str) -> Path:
+def save_review(
+    output_path: str,
+    repo: str,
+    pr_number: int | None,
+    content: str,
+    *,
+    dry_run: bool,
+    focus: str,
+) -> Path:
     path = Path(output_path)
+    link = pr_url(repo, pr_number)
     header = (
         f"# PR Review\n\n"
         f"- **Repo**: `{repo}`\n"
         f"- **PR**: `{pr_number or 'latest open'}`\n"
+    )
+    if link:
+        header += f"- **Link**: {link}\n"
+    header += (
+        f"- **Mode**: {'dry-run' if dry_run else 'live'}\n"
+        f"- **Focus**: {focus}\n"
         f"- **Generated**: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
         f"---\n\n"
     )
     path.write_text(header + content.strip() + "\n", encoding="utf-8")
     return path
 
-def build_agent(tools, *, dry_run: bool = False) -> Agent:
+
+def save_metadata_json(
+    output_path: str,
+    *,
+    repo: str,
+    pr_number: int | None,
+    dry_run: bool,
+    focus: str,
+    elapsed_seconds: float,
+    review_path: Path,
+) -> Path:
+    path = Path(output_path).with_suffix(".json")
+    payload = {
+        "repo": repo,
+        "pr_number": pr_number,
+        "pr_url": pr_url(repo, pr_number),
+        "dry_run": dry_run,
+        "focus": focus,
+        "elapsed_seconds": round(elapsed_seconds, 2),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "review_file": str(review_path.resolve()),
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def build_agent(tools, *, dry_run: bool = False, focus: str = "all") -> Agent:
     post_step = (
         "Return the full review text only. Do NOT post anything to GitHub."
         if dry_run
@@ -92,6 +177,9 @@ return the text. After posting, confirm you posted it."""
     return Agent(
         name="PR Reviewer",
         instructions=f"""You are PR-Reviewer, an AI code reviewer for GitHub pull requests.
+
+**Review focus for this run**
+{focus_instructions(focus)}
 
 **Step 1: Gather context**
 - Fetch the PR details (title, description, author).
@@ -144,6 +232,9 @@ If no issues found, write "No issues found" instead of the table.
 ### Tests
 [Were relevant tests added? Yes/No with brief explanation]
 
+### Recommended next steps
+[2-4 concrete actions for the author: fix, test, document, or merge]
+
 Be specific and actionable. Don't invent issues to seem thorough.
 If the PR looks good, say so.""",
         tools=tools,
@@ -155,6 +246,7 @@ If the PR looks good, say so.""",
 # ---------------------------------------------------------------------------
 async def main():
     args = parse_args()
+    validate_env()
 
     if not args.repo:
         raise SystemExit("Set GITHUB_REPO in your .env or pass --repo owner/name")
@@ -164,10 +256,10 @@ async def main():
 
     composio = Composio(provider=OpenAIAgentsProvider())
     session = composio.create(user_id=user_id, toolkits=["github"])
-    agent = build_agent(session.tools(), dry_run=args.dry_run)
+    agent = build_agent(session.tools(), dry_run=args.dry_run, focus=args.focus)
 
     mode = "dry-run (no GitHub comment)" if args.dry_run else "live (post comment)"
-    print(f"[pr-review] repo={args.repo} pr={args.pr or 'latest open'} mode={mode}")
+    print(f"[pr-review] repo={args.repo} pr={args.pr or 'latest open'} mode={mode} focus={args.focus}")
 
     if args.pr:
         task = (
@@ -189,10 +281,34 @@ async def main():
     elapsed = (datetime.now(timezone.utc) - started).total_seconds()
 
     output = result.final_output or ""
+    reviewed_pr = args.pr or extract_pr_number(output)
     print(output)
 
-    saved_to = save_review(args.output, args.repo, args.pr, output)
+    saved_to = save_review(
+        args.output,
+        args.repo,
+        reviewed_pr,
+        output,
+        dry_run=args.dry_run,
+        focus=args.focus,
+    )
     print(f"\n[pr-review] Saved review to {saved_to.resolve()}")
+
+    if args.json:
+        json_path = save_metadata_json(
+            args.output,
+            repo=args.repo,
+            pr_number=reviewed_pr,
+            dry_run=args.dry_run,
+            focus=args.focus,
+            elapsed_seconds=elapsed,
+            review_path=saved_to,
+        )
+        print(f"[pr-review] Saved metadata to {json_path.resolve()}")
+
+    if link := pr_url(args.repo, reviewed_pr):
+        print(f"[pr-review] PR link: {link}")
+
     print(f"[pr-review] Finished in {elapsed:.1f}s")
 
 
