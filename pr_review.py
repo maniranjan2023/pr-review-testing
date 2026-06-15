@@ -76,12 +76,7 @@ def focus_instructions(focus: str) -> str:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run an AI review on a GitHub pull request.")
-    parser.add_argument(
-        "--repo",
-        default=os.environ.get("GITHUB_REPO"),
-        help="GitHub repo as owner/name (overrides GITHUB_REPO in .env)",
-    )
+    
     parser.add_argument(
         "--pr",
         type=int,
